@@ -12,7 +12,7 @@ pub enum Action<BigUint: BigUintApi> {
 	AddBoardMember(Address),
 	AddProposer(Address),
 	RemoveUser(Address),
-	ChangeQuorum(usize),
+	ChangeQuorum(u32),
 	SendEgld {
 		to: Address,
 		amount: BigUint,

@@ -7,6 +7,12 @@ use action::{Action, ActionFullInfo, PerformActionResult};
 use user_role::UserRole;
 
 elrond_wasm::imports!();
+elrond_wasm::derive_imports!();
+
+const TOKEN_NUM_DECIMALS: usize = 0; //18
+const INITIAL_SUPPLY: u32 = 10000u32;
+const QUORUM: u32 = 6666u32;
+const ESDT_ISSUE_COST: u64 = 5000000000000000000u64;
 
 /// Multi-signature smart contract implementation.
 /// Acts like a wallet that needs multiple signers for any action performed.
@@ -14,9 +20,11 @@ elrond_wasm::imports!();
 #[elrond_wasm_derive::contract]
 pub trait Multisig {
 	/// Minimum number of signatures needed to perform any action.
+
+
 	#[view(getQuorum)]
 	#[storage_mapper("quorum")]
-	fn quorum(&self) -> SingleValueMapper<Self::Storage, usize>;
+	fn quorum(&self) -> SingleValueMapper<Self::Storage, Self::BigUint>;
 
 	#[storage_mapper("user")]
 	fn user_mapper(&self) -> UserMapper<Self::Storage>;
@@ -55,17 +63,33 @@ pub trait Multisig {
 		self.action_mapper().get(action_id)
 	}
 
-	#[storage_mapper("action_signer_ids")]
-	fn action_signer_ids(&self, action_id: usize) -> SingleValueMapper<Self::Storage, Vec<usize>>;
+	#[storage_mapper("action_signers")]
+	fn action_signers(&self, action_id: usize) -> SingleValueMapper<Self::Storage, Vec<(usize, Self::BigUint)>>;
+
+	#[view(getCumulatedShares)]
+	fn action_cumulated_shares(&self, action_id: usize) -> Self::BigUint {
+		let mut total_shares = Self::BigUint::zero();
+		for (_, shares) in self.action_signers(action_id).get() {
+			total_shares += shares;
+		}
+		total_shares
+	}
+
+	#[view(getTokenIdentifier)]
+	#[storage_mapper("esdt_token_id")]
+	fn esdt_token_id(&self) -> SingleValueMapper<Self::Storage, TokenIdentifier>;
+
+	#[view(getTokenSupply)]
+	#[storage_mapper("esdt_token_supply")]
+	fn esdt_token_supply(&self) -> SingleValueMapper<Self::Storage, Self::BigUint>;
 
 	#[init]
-	fn init(&self, quorum: usize, #[var_args] board: VarArgs<Address>) -> SCResult<()> {
+	fn init(&self, #[var_args] board: VarArgs<Address>) -> SCResult<()> {
 		require!(
 			!board.is_empty(),
 			"board cannot be empty on init, no-one would be able to propose"
 		);
-		require!(quorum <= board.len(), "quorum cannot exceed board size");
-		self.quorum().set(&quorum);
+		self.quorum().set(&Self::BigUint::from(QUORUM));
 
 		let mut duplicates = false;
 		self.user_mapper()
@@ -86,7 +110,18 @@ pub trait Multisig {
 	#[endpoint]
 	fn deposit(&self) {}
 
-	fn propose_action(&self, action: Action<Self::BigUint>) -> SCResult<usize> {
+	fn propose_action(
+		&self, 
+		action: Action<Self::BigUint>,
+		token_identifier: TokenIdentifier,
+    sc_shares: Self::BigUint,
+	) -> SCResult<usize> {
+
+		require!(
+			!self.esdt_token_id().is_empty(),
+			"Cannot propose actions until SC token is not set"
+		);
+
 		let caller_address = self.blockchain().get_caller();
 		let caller_id = self.user_mapper().get_user_id(&caller_address);
 		let caller_role = self.get_user_id_to_role(caller_id);
@@ -95,11 +130,21 @@ pub trait Multisig {
 			"only board members and proposers can propose"
 		);
 
+		require!(
+			token_identifier == self.esdt_token_id().get(),
+			"Wrong esdt"
+		);
+
+		require!(
+			sc_shares > 0,
+			"Member/proposer has no shares"
+		);
+
 		let action_id = self.action_mapper().push(&action);
 		if caller_role.can_sign() {
 			// also sign
 			// since the action is newly created, the caller can be the only signer
-			self.action_signer_ids(action_id).set(&[caller_id].to_vec());
+			self.action_signers(action_id).set(&[(caller_id, sc_shares)].to_vec());
 		}
 
 		Ok(action_id)
@@ -131,43 +176,67 @@ pub trait Multisig {
 	/// Initiates board member addition process.
 	/// Can also be used to promote a proposer to board member.
 	#[endpoint(proposeAddBoardMember)]
-	fn propose_add_board_member(&self, board_member_address: Address) -> SCResult<usize> {
-		self.propose_action(Action::AddBoardMember(board_member_address))
+	#[payable("*")]
+	fn propose_add_board_member(&self, 
+		board_member_address: Address,
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
+	) -> SCResult<usize> {
+		self.propose_action(Action::AddBoardMember(board_member_address), token_identifier, sc_shares)
 	}
 
 	/// Initiates proposer addition process..
 	/// Can also be used to demote a board member to proposer.
 	#[endpoint(proposeAddProposer)]
-	fn propose_add_proposer(&self, proposer_address: Address) -> SCResult<usize> {
-		self.propose_action(Action::AddProposer(proposer_address))
+	#[payable("*")]
+	fn propose_add_proposer(&self, 
+		proposer_address: Address,
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
+	) -> SCResult<usize> {
+		self.propose_action(Action::AddProposer(proposer_address), token_identifier, sc_shares)
 	}
 
 	/// Removes user regardless of whether it is a board member or proposer.
 	#[endpoint(proposeRemoveUser)]
-	fn propose_remove_user(&self, user_address: Address) -> SCResult<usize> {
-		self.propose_action(Action::RemoveUser(user_address))
+	#[payable("*")]
+	fn propose_remove_user(&self, 
+		user_address: Address,
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
+	) -> SCResult<usize> {
+		self.propose_action(Action::RemoveUser(user_address), token_identifier, sc_shares)
 	}
 
 	#[endpoint(proposeChangeQuorum)]
-	fn propose_change_quorum(&self, new_quorum: usize) -> SCResult<usize> {
-		self.propose_action(Action::ChangeQuorum(new_quorum))
+	#[payable("*")]
+	fn propose_change_quorum(&self, 
+		new_quorum: u32,
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
+	) -> SCResult<usize> {
+		self.propose_action(Action::ChangeQuorum(new_quorum), token_identifier, sc_shares)
 	}
 
 	#[endpoint(proposeSendEgld)]
+	#[payable("*")]
 	fn propose_send_egld(
 		&self,
 		to: Address,
 		amount: Self::BigUint,
 		#[var_args] opt_data: OptionalArg<BoxedBytes>,
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
 	) -> SCResult<usize> {
 		let data = match opt_data {
 			OptionalArg::Some(data) => data,
 			OptionalArg::None => BoxedBytes::empty(),
 		};
-		self.propose_action(Action::SendEgld { to, amount, data })
+		self.propose_action(Action::SendEgld { to, amount, data }, token_identifier, sc_shares)
 	}
 
 	#[endpoint(proposeSCDeploy)]
+	#[payable("*")]
 	fn propose_sc_deploy(
 		&self,
 		amount: Self::BigUint,
@@ -176,6 +245,8 @@ pub trait Multisig {
 		payable: bool,
 		readable: bool,
 		#[var_args] arguments: VarArgs<BoxedBytes>,
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
 	) -> SCResult<usize> {
 		let mut code_metadata = CodeMetadata::DEFAULT;
 		if upgradeable {
@@ -192,25 +263,113 @@ pub trait Multisig {
 			code,
 			code_metadata,
 			arguments: arguments.into_vec(),
-		})
+		}, token_identifier, sc_shares)
 	}
 
 	/// To be used not only for smart contract calls,
 	/// but also for ESDT calls or any protocol built-in function.
 	#[endpoint(proposeSCCall)]
+	#[payable("*")]
 	fn propose_sc_call(
 		&self,
 		to: Address,
 		egld_payment: Self::BigUint,
 		endpoint_name: BoxedBytes,
 		#[var_args] arguments: VarArgs<BoxedBytes>,
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
 	) -> SCResult<usize> {
 		self.propose_action(Action::SCCall {
 			to,
 			egld_payment,
 			endpoint_name,
 			arguments: arguments.into_vec(),
-		})
+		}, token_identifier, sc_shares)
+	}
+
+	#[payable("EGLD")]
+	#[endpoint(issueScToken)]
+	fn issue_esdt(
+		&self,
+		token_display_name: BoxedBytes,
+		token_ticker: BoxedBytes,
+		#[payment] issue_cost: Self::BigUint,
+	) -> SCResult<AsyncCall<Self::SendApi>> { 
+		only_owner!(self, "only owner may call this function");
+
+		require!(
+			self.esdt_token_id().is_empty(),
+			"SC token was already issued"
+		);
+		require!(
+			issue_cost >= Self::BigUint::from(ESDT_ISSUE_COST),
+			"Insufficient funds for issuing SC token"
+		);
+		let initial_supply = Self::BigUint::from(INITIAL_SUPPLY);
+		let issue_cost = Self::BigUint::from(ESDT_ISSUE_COST);
+		let caller_address = self.blockchain().get_caller();
+		let owner = self.user_mapper().get_user_address_unchecked(1);
+
+		require!(
+			caller_address == owner,
+			"Only owner can issue the SC token"
+		);
+
+		self.issue_started_event(&owner, token_ticker.as_slice(), &initial_supply);
+
+		Ok(ESDTSystemSmartContractProxy::new_proxy_obj(self.send())
+			.issue_fungible(
+				issue_cost,
+				&token_display_name,
+				&token_ticker,
+				&initial_supply,
+				FungibleTokenProperties {
+					num_decimals: TOKEN_NUM_DECIMALS,
+					can_freeze: false,
+					can_wipe: false,
+					can_pause: false,
+					can_mint: false,
+					can_burn: false,
+					can_change_owner: false,
+					can_upgrade: true,
+					can_add_special_roles: false,
+				},
+			)
+			.async_call()
+			.with_callback(self.callbacks().esdt_issue_callback(&owner)))
+	}
+
+	#[callback]
+	fn esdt_issue_callback(&self,
+		caller: &Address,
+    #[payment_token] token_identifier: TokenIdentifier,
+    #[payment] returned_tokens: Self::BigUint,
+		#[call_result] result: AsyncCallResult<()>,
+	) {
+		// callback is called with ESDTTransfer of the newly issued token, with the amount requested,
+		// so we can get the token identifier and amount from the call data
+		match result {
+			AsyncCallResult::Ok(()) => {
+				self.issue_success_event(&caller, &token_identifier, &returned_tokens);
+				self.esdt_token_supply().set(&returned_tokens);
+				self.esdt_token_id().set(&token_identifier);
+				if token_identifier.is_esdt() && returned_tokens > 0 {
+					let _ = self.send().direct(
+					&caller,
+					&self.esdt_token_id().get(),
+					&self.esdt_token_supply().get(),
+					b"",
+				);
+				}
+			},
+			AsyncCallResult::Err(message) => {
+				self.issue_failure_event(&caller, message.err_msg.as_slice());
+
+				// if token_identifier.is_egld() && returned_tokens > 0 {
+				// 	self.send().direct_egld(caller, &returned_tokens, &[]);
+				// }
+			},
+		}
 	}
 
 	/// Returns `true` (`1`) if the user has signed the action.
@@ -221,8 +380,16 @@ pub trait Multisig {
 		if user_id == 0 {
 			false
 		} else {
-			let signer_ids = self.action_signer_ids(action_id).get();
-			signer_ids.contains(&user_id)
+			let signer_ids = self.action_signers(action_id).get();
+
+			let mut contains = false;
+			for (user, _) in signer_ids {
+				if user == user_id {
+					contains = true;
+					break;
+				}
+			}
+			contains
 		}
 	}
 
@@ -267,10 +434,26 @@ pub trait Multisig {
 
 	/// Used by board members to sign actions.
 	#[endpoint]
-	fn sign(&self, action_id: usize) -> SCResult<()> {
+	#[payable("*")]
+	fn sign(
+		&self, 
+		action_id: usize, 
+		#[payment_token] token_identifier: TokenIdentifier,
+    #[payment] sc_shares: Self::BigUint,
+	) -> SCResult<()> {
 		require!(
 			!self.action_mapper().item_is_empty_unchecked(action_id),
 			"action does not exist"
+		);
+
+		require!(
+			token_identifier == self.esdt_token_id().get(),
+			"Wrong esdt"
+		);
+		
+		require!(
+			sc_shares > 0,
+			"Member/proposer has no shares"
 		);
 
 		let caller_address = self.blockchain().get_caller();
@@ -278,9 +461,21 @@ pub trait Multisig {
 		let caller_role = self.get_user_id_to_role(caller_id);
 		require!(caller_role.can_sign(), "only board members can sign");
 
-		self.action_signer_ids(action_id).update(|signer_ids| {
-			if !signer_ids.contains(&caller_id) {
-				signer_ids.push(caller_id);
+		let shares = sc_shares / self.esdt_token_supply().get();
+		let mut contains = 0;
+		for (i, (user_id, _)) in self.action_signers(action_id).get().iter().enumerate() {
+			if caller_id == *user_id {
+				contains = i;
+				break;
+			}
+		}
+
+		self.action_signers(action_id).update(|signer_ids| {
+			if contains == 0 {
+				signer_ids.push((caller_id, shares));
+			}
+			else {
+				signer_ids[contains].1 += shares;	
 			}
 		});
 
@@ -301,13 +496,19 @@ pub trait Multisig {
 		let caller_role = self.get_user_id_to_role(caller_id);
 		require!(caller_role.can_sign(), "only board members can un-sign");
 
-		self.action_signer_ids(action_id).update(|signer_ids| {
+		self.action_signers(action_id).update(|signer_ids| {
 			if let Some(signer_pos) = signer_ids
 				.iter()
-				.position(|&signer_id| signer_id == caller_id)
+				.position(|(signer_id, _)| *signer_id == caller_id)
 			{
 				// since we don't care about the order,
 				// it is ok to call swap_remove, which is O(1)
+				let _ = self.send().direct(
+					&caller_address,
+					&self.esdt_token_id().get(),
+					&signer_ids[signer_pos].1,
+					b"",
+				);
 				signer_ids.swap_remove(signer_pos);
 			}
 		});
@@ -360,19 +561,13 @@ pub trait Multisig {
 	/// so the result may contain invalid signers.
 	#[view(getActionSigners)]
 	fn get_action_signers(&self, action_id: usize) -> Vec<Address> {
-		self.action_signer_ids(action_id)
+		self.action_signers(action_id)
 			.get()
 			.iter()
-			.map(|signer_id| self.user_mapper().get_user_address_unchecked(*signer_id))
+			.map(|(signer_id, _)| self.user_mapper().get_user_address_unchecked(*signer_id))
 			.collect()
 	}
 
-	/// Gets addresses of all users who signed an action and are still board members.
-	/// All these signatures are currently valid.
-	#[view(getActionSignerCount)]
-	fn get_action_signer_count(&self, action_id: usize) -> usize {
-		self.action_signer_ids(action_id).get().len()
-	}
 
 	/// It is possible for board members to lose their role.
 	/// They are not automatically removed from all actions when doing so,
@@ -381,11 +576,12 @@ pub trait Multisig {
 	/// It also makes it easy to check before performing an action.
 	#[view(getActionValidSignerCount)]
 	fn get_action_valid_signer_count(&self, action_id: usize) -> usize {
-		let signer_ids = self.action_signer_ids(action_id).get();
+		let signer_ids = self.action_signers(action_id).get();
 		signer_ids
 			.iter()
-			.filter(|signer_id| {
-				let signer_role = self.get_user_id_to_role(**signer_id);
+			.filter(|signer| {
+				let (user_id, _) = *signer;
+				let signer_role = self.get_user_id_to_role(*user_id);
 				signer_role.can_sign()
 			})
 			.count()
@@ -395,7 +591,7 @@ pub trait Multisig {
 	#[view(quorumReached)]
 	fn quorum_reached(&self, action_id: usize) -> bool {
 		let quorum = self.quorum().get();
-		let valid_signers_count = self.get_action_valid_signer_count(action_id);
+		let valid_signers_count = self.action_cumulated_shares(action_id);
 		valid_signers_count >= quorum
 	}
 
@@ -436,12 +632,6 @@ pub trait Multisig {
 			},
 			Action::AddProposer(proposer_address) => {
 				self.change_user_role(proposer_address, UserRole::Proposer);
-
-				// validation required for the scenario when a board member becomes a proposer
-				require!(
-					self.quorum().get() <= self.num_board_members().get(),
-					"quorum cannot exceed board size"
-				);
 				Ok(PerformActionResult::Nothing)
 			},
 			Action::RemoveUser(user_address) => {
@@ -452,18 +642,10 @@ pub trait Multisig {
 					num_board_members + num_proposers > 0,
 					"cannot remove all board members and proposers"
 				);
-				require!(
-					self.quorum().get() <= num_board_members,
-					"quorum cannot exceed board size"
-				);
 				Ok(PerformActionResult::Nothing)
 			},
 			Action::ChangeQuorum(new_quorum) => {
-				require!(
-					new_quorum <= self.num_board_members().get(),
-					"quorum cannot exceed board size"
-				);
-				self.quorum().set(&new_quorum);
+				self.quorum().set(&Self::BigUint::from(new_quorum));
 				Ok(PerformActionResult::Nothing)
 			},
 			Action::SendEgld { to, amount, data } => Ok(PerformActionResult::SendEgld(SendEgld {
@@ -512,8 +694,17 @@ pub trait Multisig {
 	}
 
 	fn clear_action(&self, action_id: usize) {
+		for (user_id, shares) in self.action_signers(action_id).get() {
+			let user_address = self.user_mapper().get_user_address(user_id).unwrap();
+			let _ = self.send().direct(
+				&user_address,
+				&self.esdt_token_id().get(),
+				&shares,
+				b"",
+			);
+		}
 		self.action_mapper().clear_entry_unchecked(action_id);
-		self.action_signer_ids(action_id).clear();
+		self.action_signers(action_id).clear();
 	}
 
 	/// Clears storage pertaining to an action that is no longer supposed to be executed.
@@ -536,4 +727,25 @@ pub trait Multisig {
 		self.clear_action(action_id);
 		Ok(())
 	}
+
+	//events
+
+	#[event("issue-started")]
+	fn issue_started_event(
+		&self,
+		#[indexed] caller: &Address,
+		#[indexed] token_ticker: &[u8],
+		initial_supply: &Self::BigUint,
+	);
+
+	#[event("issue-success")]
+	fn issue_success_event(
+		&self,
+		#[indexed] caller: &Address,
+		#[indexed] token_identifier: &TokenIdentifier,
+		initial_supply: &Self::BigUint,
+	);
+
+	#[event("issue-failure")]
+	fn issue_failure_event(&self, #[indexed] caller: &Address, message: &[u8]);
 }
